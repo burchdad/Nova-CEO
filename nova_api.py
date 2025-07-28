@@ -1,48 +1,58 @@
 from fastapi import FastAPI, Query
-from pydantic import BaseModel
-import requests
+from pydantic import BaseModel, Field
 import aiohttp
 import asyncio
 import os
+import logging
 from datetime import datetime
+from typing import Optional
 
+# ===========================
+# 🔹 App + Logging Setup
+# ===========================
 app = FastAPI()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ===========================
+# 🔹 Secure Env Loader
+# ===========================
+def get_env_var(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
 # ===========================
 # 🔹 Airtable Config
 # ===========================
-AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
-BASE_ID = os.environ.get("BASE_ID")
-    if not AIRTABLE_API_KEY or not BASE_ID:
-    raise RuntimeError("🚨 Missing environment variables! Check Render settings.")
-TABLE_ID_COMMANDS = os.environ.get("TABLE_ID_COMMANDS")
-TABLE_ID_GPT_TREE = os.environ.get("TABLE_ID_GPT_TREE")
-TABLE_ID_TASKS = os.environ.get("TABLE_ID_TASKS")
-TABLE_ID_KPIS = os.environ.get("TABLE_ID_KPIS")
-TABLE_ID_AI_AGENTS = os.environ.get("TABLE_ID_AI_AGENTS")
-TABLE_ID_DEPARTMENTS = os.environ.get("TABLE_ID_DEPARTMENTS")
+AIRTABLE_API_KEY = get_env_var("AIRTABLE_API_KEY")
+BASE_ID = get_env_var("BASE_ID")
+TABLE_ID_COMMANDS = get_env_var("TABLE_ID_COMMANDS")
+TABLE_ID_GPT_TREE = get_env_var("TABLE_ID_GPT_TREE")
+TABLE_ID_TASKS = get_env_var("TABLE_ID_TASKS")
+TABLE_ID_KPIS = get_env_var("TABLE_ID_KPIS")
+TABLE_ID_AI_AGENTS = get_env_var("TABLE_ID_AI_AGENTS")
+TABLE_ID_DEPARTMENTS = get_env_var("TABLE_ID_DEPARTMENTS")
+
+def airtable_headers():
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
 
 # ===========================
 # 🔹 Nova Command Input Model
 # ===========================
 class CommandInput(BaseModel):
-    command: str
+    command: str = Field(..., min_length=5, max_length=500)
 
 # ===========================
-# ✅ EXISTING: Nova Command Endpoint
+# ✅ POST /nova/command
 # ===========================
 @app.post("/nova/command")
-def process_command(input: CommandInput):
+async def process_command(input: CommandInput):
     try:
         command_text = input.command
         issued_date = datetime.utcnow().strftime("%Y-%m-%d")
 
-        airtable_url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_COMMANDS}"
-        headers = {
-            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
+        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_COMMANDS}"
         payload = {
             "fields": {
                 "Command Name": command_text[:255],
@@ -57,243 +67,135 @@ def process_command(input: CommandInput):
             }
         }
 
-        response = requests.post(airtable_url, headers=headers, json=payload)
-
-        print("🔗 Airtable URL:", airtable_url)
-        print("📥 Command Text:", command_text)
-        print("📅 Issued Date:", issued_date)
-        print("🔍 Airtable Response:", response.status_code, response.text)
-
-        if response.status_code in (200, 201):
-            return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
-        else:
-            return {"status": "error", "message": "❌ Failed to log to Airtable", "details": response.text}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=airtable_headers(), json=payload) as resp:
+                response_data = await resp.text()
+                if resp.status in (200, 201):
+                    return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
+                else:
+                    logging.error(f"❌ Airtable Error: {resp.status} - {response_data}")
+                    return {"status": "error", "message": "Failed to log to Airtable", "details": response_data}
 
     except Exception as e:
-        print("❌ Exception:", str(e))
+        logging.exception("Unhandled exception in /nova/command")
         return {"status": "error", "message": "Internal server error", "details": str(e)}
 
 # ===========================
-# ✅ GPT Tree Helpers
+# ✅ GPT Tree Fetch + Builder
 # ===========================
-async def fetch_gpt_tree_records():
-    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_GPT_TREE}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-            return data.get("records", [])
-
-def map_record_ids(records):
-    id_to_name = {}
-    for rec in records:
-        rec_id = rec.get("id")
-        fields = rec.get("fields", {})
-        if rec_id and fields.get("GPT Name"):
-            id_to_name[rec_id] = fields["GPT Name"]
-    return id_to_name
-
-def build_tree(records, id_to_name, parent_name=None):
-    tree = []
-    for rec in records:
-        fields = rec.get("fields", {})
-        gpt_name = fields.get("GPT Name", "")
-        gpt_id = fields.get("GPT ID")
-        parent_ids = fields.get("Parent GPT", [])
-        parent_names = [id_to_name.get(pid, pid) for pid in parent_ids]
-
-        if (parent_name is None and gpt_name == "Nova CEO GPT") or (parent_name in parent_names):
-            children = build_tree(records, id_to_name, gpt_name)
-            tree.append({
-                "name": gpt_name,
-                "id": gpt_id,
-                "role": fields.get("Role / Department"),
-                "status": fields.get("Status"),
-                "linked_department": fields.get("Linked Department"),
-                "dashboard_url": fields.get("Dashboards URL"),
-                "children": children
-            })
-    return tree
-
 @app.get("/nova/gpt_tree")
 async def get_gpt_tree():
     try:
-        records = await fetch_gpt_tree_records()
-        id_to_name = map_record_ids(records)
-        tree = build_tree(records, id_to_name)
-        return {"gpt_tree": tree}
+        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_GPT_TREE}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=airtable_headers()) as resp:
+                records = (await resp.json()).get("records", [])
+
+        id_to_name = {r["id"]: r["fields"].get("GPT Name") for r in records if r["fields"].get("GPT Name")}
+
+        def build_tree(name=None):
+            tree = []
+            for r in records:
+                f = r["fields"]
+                gpt_name = f.get("GPT Name")
+                if (not name and gpt_name == "Nova CEO GPT") or (name and name in [id_to_name.get(pid) for pid in f.get("Parent GPT", [])]):
+                    children = build_tree(gpt_name)
+                    tree.append({
+                        "name": gpt_name,
+                        "id": f.get("GPT ID", r["id"]),
+                        "role": f.get("Role / Department"),
+                        "status": f.get("Status"),
+                        "linked_department": f.get("Linked Department"),
+                        "dashboard_url": f.get("Dashboards URL"),
+                        "children": children
+                    })
+            return tree
+
+        return {"status": "success", "data": {"gpt_tree": build_tree()}}
+
     except Exception as e:
-        print("❌ GPT Tree Error:", str(e))
+        logging.exception("GPT Tree build error")
         return {"status": "error", "message": "Failed to fetch GPT Tree", "details": str(e)}
 
 # ===========================
-# ✅ Fetch Helpers for GPT Health
-# ===========================
-
-async def fetch_ai_agents():
-    """Fetch AI Agents table (true source for task links)."""
-    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_AI_AGENTS}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-
-            # ✅ DEBUG: Print the first record’s fields to inspect actual column names
-            if data.get("records"):
-                print("🔍 SAMPLE AI Agent Fields:", data["records"][0].get("fields", {}))
-
-            return data.get("records", [])
-
-async def fetch_tasks():
-    """Fetch all Tasks (for status lookups)."""
-    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_TASKS}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            return (await resp.json()).get("records", [])
-
-async def fetch_kpis():
-    """Fetch all KPIs (for linking to AI Agents)."""
-    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_KPIS}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            return (await resp.json()).get("records", [])
-
-async def fetch_departments():
-    url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_DEPARTMENTS}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            return (await resp.json()).get("records", [])
-
-# ===========================
-# ✅ GPT Health Endpoint (with optional debug mode)
+# ✅ GPT Health Endpoint
 # ===========================
 @app.get("/nova/gpt_health")
-async def get_gpt_health(debug: bool = Query(False, description="Enable detailed debug info for tasks/KPIs")):
+async def get_gpt_health(debug: bool = Query(False)):
     try:
-        # ✅ Fetch everything in parallel
-        ai_agents_task = fetch_ai_agents()
-        tasks_records_task = fetch_tasks()
-        kpi_records_task = fetch_kpis()
-        departments_task = fetch_departments()
-
-        ai_agents_records, tasks_records, kpi_records, departments_records = await asyncio.gather(
-            ai_agents_task,
-            tasks_records_task,
-            kpi_records_task,
-            departments_task
-        )
-
-        # ✅ Build Department lookup: {recID → details}
-        department_lookup = {
-            dept["id"]: {
-                "name": dept["fields"].get("Department Name", "Unknown"),
-                "priority": dept["fields"].get("Priority", "Unknown"),
-                "status": dept["fields"].get("Status", "Unknown"),
-                "dashboard_url": dept["fields"].get("Dashboard URL", None),
-                "head_agent": dept["fields"].get("Head AI Agent", []),
+        async with aiohttp.ClientSession() as session:
+            urls = {
+                "agents": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_AI_AGENTS}",
+                "tasks": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_TASKS}",
+                "kpis": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_KPIS}",
+                "departments": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_DEPARTMENTS}"
             }
-            for dept in departments_records
+            headers = airtable_headers()
+
+            async def fetch(url):
+                async with session.get(url, headers=headers) as resp:
+                    return (await resp.json()).get("records", [])
+
+            agents, tasks, kpis, departments = await asyncio.gather(
+                fetch(urls["agents"]), fetch(urls["tasks"]), fetch(urls["kpis"]), fetch(urls["departments"])
+            )
+
+        dept_lookup = {
+            d["id"]: {
+                "name": d["fields"].get("Department Name"),
+                "priority": d["fields"].get("Priority"),
+                "status": d["fields"].get("Status"),
+                "dashboard_url": d["fields"].get("Dashboard URL"),
+                "head_agent": d["fields"].get("Head AI Agent")
+            } for d in departments
         }
 
-        health_data = []
+        results = []
+        for a in agents:
+            f = a["fields"]
+            record_id = a["id"]
+            gpt_name = f.get("Agent Name") or f.get("GPT ID") or record_id
+            dept_id = f.get("Assigned Department", [None])[0]
+            dept = dept_lookup.get(dept_id)
 
-        for agent in ai_agents_records:
-            fields = agent.get("fields", {})
+            task_ids = f.get("Tasks", [])
+            task_details = [t for t in tasks if t["id"] in task_ids]
+            kpi_list = [
+                {
+                    "kpi_name": k["fields"].get("KPI Name"),
+                    "current_score": k["fields"].get("Current Score"),
+                    "target_score": k["fields"].get("Target Score"),
+                    "performance_status": k["fields"].get("Performance Status")
+                }
+                for k in kpis if record_id in k["fields"].get("AI Agents", [])
+            ]
 
-            # ✅ Pick the best possible GPT Name (multiple fallbacks)
-            gpt_name = (
-                fields.get("AI Agent Name") or
-                fields.get("Agent Name") or
-                fields.get("GPT ID") or
-                agent.get("id", "Unnamed GPT")
-            )
-
-            # ✅ Airtable Record ID for backend linking
-            gpt_record_id = agent.get("id", "")
-
-            # ✅ Internal GPT ID (fallback to record_id if missing)
-            gpt_internal_id = fields.get("GPT ID", gpt_record_id)
-
-            # ✅ Status
-            gpt_status = fields.get("Status", "Unknown")
-
-            # ✅ Resolve Role / Department
-            assigned_depts = fields.get("Assigned Department", [])
-            dept_details = None
-            gpt_role = "Unknown"
-            if assigned_depts:
-                dept_id = assigned_depts[0]  # Take first if multiple
-                dept_details = department_lookup.get(dept_id, None)
-                if dept_details:
-                    gpt_role = dept_details["name"]
-
-            # ✅ Tasks linked to this AI Agent
-            linked_task_ids = fields.get("Tasks", [])
-            gpt_tasks = [t for t in tasks_records if t["id"] in linked_task_ids]
-
-            total_tasks = len(gpt_tasks)
-            active_tasks = sum(
-                1 for t in gpt_tasks if t.get("fields", {}).get("Status") not in ["Complete", "Archived"]
-            )
-            completed_tasks = sum(
-                1 for t in gpt_tasks if t.get("fields", {}).get("Status") == "Complete"
-            )
-
-            # ✅ KPIs linked to this AI Agent
-            gpt_kpis = []
-            for kpi in kpi_records:
-                kpi_fields = kpi.get("fields", {})
-                linked_agents = kpi_fields.get("AI Agents", [])
-                if gpt_record_id in linked_agents:
-                    gpt_kpis.append({
-                        "kpi_name": kpi_fields.get("KPI Name"),
-                        "current_score": kpi_fields.get("Current Score"),
-                        "target_score": kpi_fields.get("Target Score"),
-                        "performance_status": kpi_fields.get("Performance Status")
-                    })
-
-            # ✅ Debugging linked tasks + KPIs if requested
-            debug_task_list = []
-            debug_kpi_list = []
+            result = {
+                "gpt_name": gpt_name,
+                "gpt_id": record_id,
+                "internal_gpt_id": f.get("GPT ID", record_id),
+                "role": dept["name"] if dept else None,
+                "status": f.get("Status"),
+                "department": dept,
+                "total_tasks": len(task_details),
+                "active_tasks": sum(1 for t in task_details if t["fields"].get("Status") not in ["Complete", "Archived"]),
+                "completed_tasks": sum(1 for t in task_details if t["fields"].get("Status") == "Complete"),
+                "linked_kpis": kpi_list
+            }
             if debug:
-                debug_task_list = [
+                result["debug_linked_tasks"] = [
                     {
                         "task_name": t["fields"].get("Task Name"),
                         "status": t["fields"].get("Status"),
                         "due_date": t["fields"].get("Due Date")
-                    } for t in gpt_tasks
+                    } for t in task_details
                 ]
-                debug_kpi_list = gpt_kpis
+                result["debug_linked_kpis"] = kpi_list
 
-            # ✅ Build GPT Health entry
-            health_entry = {
-                "gpt_name": gpt_name,
-                "gpt_id": gpt_record_id,
-                "internal_gpt_id": gpt_internal_id,
-                "role": gpt_role,
-                "status": gpt_status,
-                "department": dept_details if dept_details and dept_details["name"] != "Unknown" else None,
-                "total_tasks": total_tasks,
-                "active_tasks": active_tasks,
-                "completed_tasks": completed_tasks,
-                "linked_kpis": gpt_kpis
-            }
+            results.append(result)
 
-            if debug:
-                health_entry["debug_linked_tasks"] = debug_task_list
-                health_entry["debug_linked_kpis"] = debug_kpi_list
-
-            health_data.append(health_entry)
-
-        return {"gpt_health": health_data, "debug_mode": debug}
+        return {"status": "success", "debug_mode": debug, "data": results}
 
     except Exception as e:
-        print("❌ GPT Health Error:", str(e))
-        return {
-            "status": "error",
-            "message": "Failed to fetch GPT health stats",
-            "details": str(e)
-        }
+        logging.exception("GPT Health error")
+        return {"status": "error", "message": "Failed to fetch GPT health stats", "details": str(e)}
