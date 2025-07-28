@@ -2,10 +2,10 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 import aiohttp
 import asyncio
-import os
 import logging
 from datetime import datetime
 from typing import Optional
+from decouple import config
 
 # ===========================
 # 🔹 App + Logging Setup
@@ -14,45 +14,69 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ===========================
-# 🔹 Secure Env Loader
+# 🔹 Persistent aiohttp Session
 # ===========================
-def get_env_var(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+session = aiohttp.ClientSession()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await session.close()
 
 # ===========================
-# 🔹 Airtable Config
+# 🔹 Airtable Config (via python-decouple)
 # ===========================
-AIRTABLE_API_KEY = get_env_var("AIRTABLE_API_KEY")
-BASE_ID = get_env_var("BASE_ID")
-TABLE_ID_COMMANDS = get_env_var("TABLE_ID_COMMANDS")
-TABLE_ID_GPT_TREE = get_env_var("TABLE_ID_GPT_TREE")
-TABLE_ID_TASKS = get_env_var("TABLE_ID_TASKS")
-TABLE_ID_KPIS = get_env_var("TABLE_ID_KPIS")
-TABLE_ID_AI_AGENTS = get_env_var("TABLE_ID_AI_AGENTS")
-TABLE_ID_DEPARTMENTS = get_env_var("TABLE_ID_DEPARTMENTS")
+AIRTABLE_API_KEY = config("AIRTABLE_API_KEY", default="")
+BASE_ID = config("BASE_ID", default="")
+TABLE_ID_COMMANDS = config("TABLE_ID_COMMANDS", default="")
+TABLE_ID_GPT_TREE = config("TABLE_ID_GPT_TREE", default="")
+TABLE_ID_TASKS = config("TABLE_ID_TASKS", default="")
+TABLE_ID_KPIS = config("TABLE_ID_KPIS", default="")
+TABLE_ID_AI_AGENTS = config("TABLE_ID_AI_AGENTS", default="")
+TABLE_ID_DEPARTMENTS = config("TABLE_ID_DEPARTMENTS", default="")
 
-def airtable_headers():
-    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+if not AIRTABLE_API_KEY:
+    raise RuntimeError("Missing AIRTABLE_API_KEY")
+
+# ===========================
+# 🔹 Airtable Helper Class
+# ===========================
+class AirtableClient:
+    def __init__(self, base_id, api_key):
+        self.base_url = f"https://api.airtable.com/v0/{base_id}"
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+    async def fetch(self, table_id):
+        url = f"{self.base_url}/{table_id}"
+        async with session.get(url, headers=self.headers) as resp:
+            return await resp.json()
+
+    async def post(self, table_id, payload):
+        url = f"{self.base_url}/{table_id}"
+        async with session.post(url, headers=self.headers, json=payload) as resp:
+            return resp.status, await resp.text()
+
+airtable = AirtableClient(BASE_ID, AIRTABLE_API_KEY)
 
 # ===========================
 # 🔹 Nova Command Input Model
 # ===========================
 class CommandInput(BaseModel):
-    command: str = Field(..., min_length=5, max_length=500)
+    command: str = Field(..., min_length=5, max_length=500, regex=r"^[a-zA-Z0-9\s.,?!@#&()\-_=+]+$")
 
 # ===========================
 # ✅ POST /nova/command
 # ===========================
 @app.post("/nova/command")
 async def process_command(input: CommandInput):
+    """
+    Processes a command and logs it to Airtable.
+    """
     try:
         command_text = input.command
         issued_date = datetime.utcnow().strftime("%Y-%m-%d")
-
-        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_COMMANDS}"
         payload = {
             "fields": {
                 "Command Name": command_text[:255],
@@ -66,18 +90,14 @@ async def process_command(input: CommandInput):
                 "Comments": "Queued from Nova mobile demo"
             }
         }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=airtable_headers(), json=payload) as resp:
-                response_data = await resp.text()
-                if resp.status in (200, 201):
-                    return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
-                else:
-                    logging.error(f"❌ Airtable Error: {resp.status} - {response_data}")
-                    return {"status": "error", "message": "Failed to log to Airtable", "details": response_data}
-
+        status, response_data = await airtable.post(TABLE_ID_COMMANDS, payload)
+        if status in (200, 201):
+            return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
+        else:
+            logging.error(f"❌ Airtable Error: {status} - {response_data[:200]}")
+            return {"status": "error", "message": "Failed to log to Airtable", "details": response_data[:200]}
     except Exception as e:
-        logging.exception("Unhandled exception in /nova/command")
+        logging.exception(f"Unhandled exception in /nova/command: {e}")
         return {"status": "error", "message": "Internal server error", "details": str(e)}
 
 # ===========================
@@ -85,12 +105,11 @@ async def process_command(input: CommandInput):
 # ===========================
 @app.get("/nova/gpt_tree")
 async def get_gpt_tree():
+    """
+    Constructs a tree of GPTs from Airtable based on parent-child hierarchy.
+    """
     try:
-        url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_GPT_TREE}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=airtable_headers()) as resp:
-                records = (await resp.json()).get("records", [])
-
+        records = (await airtable.fetch(TABLE_ID_GPT_TREE)).get("records", [])
         id_to_name = {r["id"]: r["fields"].get("GPT Name") for r in records if r["fields"].get("GPT Name")}
 
         def build_tree(name=None):
@@ -114,7 +133,7 @@ async def get_gpt_tree():
         return {"status": "success", "data": {"gpt_tree": build_tree()}}
 
     except Exception as e:
-        logging.exception("GPT Tree build error")
+        logging.exception(f"GPT Tree build error: {e}")
         return {"status": "error", "message": "Failed to fetch GPT Tree", "details": str(e)}
 
 # ===========================
@@ -122,23 +141,21 @@ async def get_gpt_tree():
 # ===========================
 @app.get("/nova/gpt_health")
 async def get_gpt_health(debug: bool = Query(False)):
+    """
+    Aggregates GPT health stats across agents, tasks, KPIs, and departments.
+    """
     try:
-        async with aiohttp.ClientSession() as session:
-            urls = {
-                "agents": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_AI_AGENTS}",
-                "tasks": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_TASKS}",
-                "kpis": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_KPIS}",
-                "departments": f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_DEPARTMENTS}"
-            }
-            headers = airtable_headers()
+        agents, tasks, kpis, departments = await asyncio.gather(
+            airtable.fetch(TABLE_ID_AI_AGENTS),
+            airtable.fetch(TABLE_ID_TASKS),
+            airtable.fetch(TABLE_ID_KPIS),
+            airtable.fetch(TABLE_ID_DEPARTMENTS)
+        )
 
-            async def fetch(url):
-                async with session.get(url, headers=headers) as resp:
-                    return (await resp.json()).get("records", [])
-
-            agents, tasks, kpis, departments = await asyncio.gather(
-                fetch(urls["agents"]), fetch(urls["tasks"]), fetch(urls["kpis"]), fetch(urls["departments"])
-            )
+        agents = agents.get("records", [])
+        tasks = tasks.get("records", [])
+        kpis = kpis.get("records", [])
+        departments = departments.get("records", [])
 
         dept_lookup = {
             d["id"]: {
@@ -182,6 +199,7 @@ async def get_gpt_health(debug: bool = Query(False)):
                 "completed_tasks": sum(1 for t in task_details if t["fields"].get("Status") == "Complete"),
                 "linked_kpis": kpi_list
             }
+
             if debug:
                 result["debug_linked_tasks"] = [
                     {
@@ -197,5 +215,5 @@ async def get_gpt_health(debug: bool = Query(False)):
         return {"status": "success", "debug_mode": debug, "data": results}
 
     except Exception as e:
-        logging.exception("GPT Health error")
+        logging.exception(f"GPT Health error: {e}")
         return {"status": "error", "message": "Failed to fetch GPT health stats", "details": str(e)}
