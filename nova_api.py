@@ -13,6 +13,8 @@ app = FastAPI()
 # ===========================
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 BASE_ID = os.environ.get("BASE_ID")
+    if not AIRTABLE_API_KEY or not BASE_ID:
+    raise RuntimeError("🚨 Missing environment variables! Check Render settings.")
 TABLE_ID_COMMANDS = os.environ.get("TABLE_ID_COMMANDS")
 TABLE_ID_GPT_TREE = os.environ.get("TABLE_ID_GPT_TREE")
 TABLE_ID_TASKS = os.environ.get("TABLE_ID_TASKS")
