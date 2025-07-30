@@ -39,6 +39,10 @@ async def process_command(input: CommandInput):
                 "Comments": "Queued from Nova mobile demo"
             }
         }
+
+        # 🧪 Debug: Print the Table ID used for Airtable request
+        print("🧪 TABLE_ID_COMMANDS:", TABLE_ID_COMMANDS)
+
         status, response_data = await airtable.post(TABLE_ID_COMMANDS, payload)
         if status in (200, 201):
             return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
