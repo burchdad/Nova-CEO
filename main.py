@@ -1,12 +1,19 @@
 from fastapi import FastAPI
-from routes.nova_routes import router as nova_router
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+from routes.nova_routes import nova_router
+from services.airtable_service import airtable
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await airtable.init_session()  # Startup
+    yield
+    await airtable.close_session()  # Shutdown
+
+app = FastAPI(lifespan=lifespan)
+
 app.include_router(nova_router, prefix="/nova")
 
-# Gracefully shutdown aiohttp session
-from services.airtable_service import close_session
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await close_session()
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the Nova CEO API"}
