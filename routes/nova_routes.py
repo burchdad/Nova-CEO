@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query
+import requests
 from pydantic import BaseModel, Field
 from datetime import datetime
 import logging
@@ -6,6 +7,8 @@ import asyncio
 
 from services.airtable_service import airtable
 from utils.config import (
+    AIRTABLE_API_KEY,
+    BASE_ID,
     TABLE_ID_COMMANDS,
     TABLE_ID_GPT_TREE,
     TABLE_ID_AI_AGENTS,
@@ -26,6 +29,14 @@ async def process_command(input: CommandInput):
     try:
         command_text = input.command
         issued_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        airtable_url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_COMMANDS}"
+        headers = {
+            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+
         payload = {
             "fields": {
                 "Command Name": command_text[:255],
@@ -39,6 +50,13 @@ async def process_command(input: CommandInput):
                 "Comments": "Queued from Nova mobile demo"
             }
         }
+
+        response = requests.post(airtable_url, headers=headers, json=payload)
+
+        print("🔗 Airtable URL:", airtable_url)
+        print("📥 Command Text:", command_text)
+        print("📅 Issued Date:", issued_date)
+        print("🔍 Airtable Response:", response.status_code, response.text)
 
         # 🧪 Debug: Print the Table ID used for Airtable request
         print("🧪 TABLE_ID_COMMANDS:", TABLE_ID_COMMANDS)
