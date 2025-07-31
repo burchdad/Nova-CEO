@@ -24,18 +24,13 @@ class CommandInput(BaseModel):
     command: str = Field(..., min_length=5, max_length=500, pattern=r"^[a-zA-Z0-9\s.,?!@#&()\-_=+]+$")
 
 
-@nova_router.post("/command", tags=["Commands"])
+nova_router.post("/command", tags=["Commands"])
 async def process_command(input: CommandInput):
     try:
         command_text = input.command
         issued_date = datetime.utcnow().strftime("%Y-%m-%d")
 
-        airtable_url = f"https://api.airtable.com/v0/{BASE_ID}/{TABLE_ID_COMMANDS}"
-        headers = {
-            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
+        print("🧪 TABLE_ID_COMMANDS:", TABLE_ID_COMMANDS)
 
         payload = {
             "fields": {
@@ -51,17 +46,8 @@ async def process_command(input: CommandInput):
             }
         }
 
-        response = requests.post(airtable_url, headers=headers, json=payload)
-
-        print("🔗 Airtable URL:", airtable_url)
-        print("📥 Command Text:", command_text)
-        print("📅 Issued Date:", issued_date)
-        print("🔍 Airtable Response:", response.status_code, response.text)
-
-        # 🧪 Debug: Print the Table ID used for Airtable request
-        print("🧪 TABLE_ID_COMMANDS:", TABLE_ID_COMMANDS)
-
         status, response_data = await airtable.post(TABLE_ID_COMMANDS, payload)
+
         if status in (200, 201):
             return {"status": "success", "message": f"✅ Logged in Airtable: {command_text}"}
         else:
@@ -71,6 +57,7 @@ async def process_command(input: CommandInput):
                 "message": "Failed to log to Airtable",
                 "details": response_data[:200]
             }
+
     except Exception as e:
         logging.exception("Unhandled exception in /nova/command")
         return {
@@ -79,14 +66,14 @@ async def process_command(input: CommandInput):
             "details": str(e)
         }
 
-
 @nova_router.get("/gpt_tree", tags=["GPT Tree"])
 async def get_gpt_tree():
     try:
         records = (await airtable.fetch(TABLE_ID_GPT_TREE)).get("records", [])
         id_to_name = {
-            r["id"]: r["fields"].get("GPT Name")
-            for r in records if r["fields"].get("GPT Name")
+            r["id"]: r["fields"]["GPT Name"]
+            for r in records
+            if isinstance(r.get("fields", {}), dict) and "GPT Name" in r["fields"]
         }
 
         def build_tree(parent_name=None):
